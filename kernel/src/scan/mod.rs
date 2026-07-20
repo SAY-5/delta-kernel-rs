@@ -10,7 +10,7 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
-use self::data_skipping::as_checkpoint_skipping_predicate;
+use self::data_skipping::as_prefixed_checkpoint_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -993,58 +993,44 @@ impl Scan {
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
-    /// The scan predicate is transformed into a data-skipping form: data-column references become
-    /// `stats_parsed.{minValues,maxValues,nullCount}.<col>` with IS NULL guards (e.g., `x > 100`
-    /// becomes `OR(stats_parsed.maxValues.x IS NULL, stats_parsed.maxValues.x > 100)`), and
-    /// partition-column references become `partitionValues_parsed.<col>` without a guard. Those
-    /// references are then prefixed with `add` to match the checkpoint/sidecar column layout
-    /// (`add.stats_parsed.*` / `add.partitionValues_parsed.*`), so the parquet reader's row group
-    /// filter can use footer statistics to skip row groups that cannot contain matching files.
-    ///
-    /// The IS NULL guards on data columns are necessary because parquet footer min/max statistics
-    /// ignore null values. Without them, row groups containing files with missing stats (null stat
-    /// columns) could be incorrectly pruned. Partition values are always present (never missing),
-    /// so their footer min/max are trustworthy and need no guard.
+    /// The scan predicate is rewritten into a data-skipping form scoped under the `add` action:
+    /// data-column references become `add.stats_parsed.{minValues,maxValues,nullCount}.<col>` and
+    /// partition references become `add.partitionValues_parsed.<col>`, so the parquet reader's row
+    /// group filter can use footer statistics to skip row groups that cannot contain matching
+    /// files. See [`as_prefixed_checkpoint_predicate`] for the rewrite and its IS NULL guards.
     ///
     /// Returns `None` if the scan has no predicate, if neither a data-column stats schema nor a
-    /// partition-values schema is available, or if the predicate is a bare unsupported expression
-    /// (e.g. column-column comparison). Junctions with unsupported arms replace them with a NULL
-    /// literal to conservatively prevent pruning.
+    /// partition schema is available, or if the predicate is a bare unsupported expression (e.g.
+    /// column-column comparison). Junctions with unsupported arms replace them with a NULL literal
+    /// to conservatively prevent pruning.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
-        // Skipping needs either data-column stats (`stats_parsed`) or partition values
-        // (`partitionValues_parsed`) to rewrite against. A partition-only predicate has no
-        // `stats_parsed` schema, so gating on stats alone would wrongly drop it.
+        // Skipping needs either data-column stats or partition values to rewrite against; a
+        // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
+        // unpartitioned table has no partition schema.
         if self.state_info.physical_stats_schema.is_none()
             && self.state_info.physical_partition_schema.is_none()
         {
             return None;
         }
 
-        // Partition detection must use PHYSICAL names: the predicate references physical columns
-        // (under column mapping) and `partitionValues_parsed` is keyed by physical name.
-        // `metadata().partition_columns()` holds logical names, so it would never match here.
+        // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
+        // the predicate also references physical columns, so partition detection reads the physical
+        // partition schema.
         let partition_columns: HashSet<String> = self
             .state_info
             .physical_partition_schema
             .as_ref()
             .map(|s| s.fields().map(|f| f.name().to_string()).collect())
             .unwrap_or_default();
-        let skipping_pred = as_checkpoint_skipping_predicate(
+        let prefixed = as_prefixed_checkpoint_predicate(
             predicate,
             &partition_columns,
             &self.state_info.physical_stats_columns,
         )?;
-
-        // `skipping_pred` already carries the `stats_parsed.*` / `partitionValues_parsed.*` struct
-        // paths, so we only scope them under the `add` action.
-        let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add"]),
-        };
-        let prefixed = prefixer.transform_pred(&skipping_pred);
-        Some(Arc::new(prefixed.into_owned()))
+        Some(Arc::new(prefixed))
     }
 
     /// Start a parallel scan metadata processing for the table.

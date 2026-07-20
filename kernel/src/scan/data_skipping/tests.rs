@@ -502,11 +502,9 @@ fn test_checkpoint_skipping_semantic(
 
 // Checkpoint row-group skipping for a partition-only predicate. Partition values live in
 // `partitionValues_parsed.<col>` (exact value = both min and max), so `part_col = 'B'` becomes a
-// min/max range check the parquet footer can evaluate. Unlike data columns, partition comparisons
-// carry NO IS NULL guard and NO is_add guard: partition footer min/max are always trustworthy, and
-// there is no `is_add` column in checkpoint parquet. Resolving only
-// `partitionValues_parsed.part_col` (no `is_add`) and still getting a definite FALSE proves no such
-// guard was emitted.
+// min/max range check the parquet footer can evaluate, wrapped in an IS NULL guard that keeps a row
+// group holding a null partition value (a non-Add row). Resolving a real value drives the exact
+// verdict: matching value keeps, out-of-range value prunes.
 #[rstest]
 #[case::below("A", FALSE, "part='A', pred part='B' -> skip")]
 #[case::match_("B", TRUE, "part='B', pred part='B' -> keep")]
@@ -528,6 +526,27 @@ fn test_checkpoint_skipping_partition_column(
     )]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
+}
+
+// The IS NULL guard on a partition comparison keeps a row group whose partition value is null (a
+// non-Add row such as a Remove). Without the guard, `part_col = 'B'` would resolve to FALSE against
+// a null value and wrongly prune the row group, dropping the tombstone from log replay.
+#[test]
+fn test_checkpoint_skipping_partition_null_value_kept() {
+    let partition_columns = HashSet::from(["part_col".to_string()]);
+    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("B"));
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new()).unwrap();
+    let resolver = HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        Scalar::Null(DataType::STRING),
+    )]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&skipping_pred),
+        TRUE,
+        "null partition value (non-Add row) must be kept by the IS NULL guard"
+    );
 }
 
 // Checkpoint partition skipping across comparison operators, modeling a row group whose add files
@@ -567,23 +586,31 @@ fn test_checkpoint_skipping_partition_range_ops(
     );
 }
 
-// Partition IS NULL / IS NOT NULL. Partition values are always present for add files, so the
-// checkpoint reads `partitionValues_parsed.part_col IS [NOT] NULL` directly (no nullCount stat, no
-// is_add guard). Resolving to a non-null value: IS NULL -> skip (FALSE), IS NOT NULL -> keep
-// (TRUE).
-#[rstest]
-#[case::is_null(Pred::is_null(column_expr!("part_col")), FALSE)]
-#[case::is_not_null(Pred::not(Pred::is_null(column_expr!("part_col"))), TRUE)]
-fn test_checkpoint_skipping_partition_is_null(#[case] pred: Pred, #[case] expected: Option<bool>) {
+// Partition `IS NULL` reads `partitionValues_parsed.part_col IS NULL` directly: a row group with no
+// null partition value holds only Add rows with real values, so a non-null value prunes it (FALSE).
+#[test]
+fn test_checkpoint_skipping_partition_is_null() {
     let partition_columns = HashSet::from(["part_col".to_string()]);
-    let stats = HashSet::new();
+    let pred = Pred::is_null(column_expr!("part_col"));
     let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new()).unwrap();
     let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
         column_name!("partitionValues_parsed.part_col"),
         Scalar::from("x"),
     )]));
-    expect_eq!(resolver.eval(&skipping_pred), expected, "{pred:?}");
+    expect_eq!(resolver.eval(&skipping_pred), FALSE, "{pred:?}");
+}
+
+// Partition `IS NOT NULL` can't prune: a non-Add row also has a null partition value, so proving
+// the value is non-null would drop those rows. It produces no skipping predicate (#1873).
+#[test]
+fn test_checkpoint_skipping_partition_is_not_null_never_prunes() {
+    let partition_columns = HashSet::from(["part_col".to_string()]);
+    let pred = Pred::not(Pred::is_null(column_expr!("part_col")));
+    assert!(
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new()).is_none(),
+        "partition IS NOT NULL must not produce a skipping predicate"
+    );
 }
 
 // SAFETY: when the checkpoint lacks `partitionValues_parsed` (older writer), the meta-predicate
@@ -653,8 +680,8 @@ fn test_checkpoint_skipping_mixed_partition_and_data(
 }
 
 // Partition timestamp columns are exact (never truncated), so unlike data-column timestamps they
-// get NO 999us max-stat adjustment. `part_ts = T` rewrites to a bare range check on the exact
-// value, so the max leg compares against T (not T-999).
+// get NO 999us max-stat adjustment. `part_ts > T` compares against the exact value T (not T-999),
+// under the IS NULL guard that keeps non-Add rows.
 #[test]
 fn test_checkpoint_skipping_partition_timestamp_no_truncation_adjustment() {
     let partition_columns = HashSet::from(["part_ts".to_string()]);
@@ -664,7 +691,8 @@ fn test_checkpoint_skipping_partition_timestamp_no_truncation_adjustment() {
         as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
     assert_eq!(
         skipping_pred.to_string(),
-        "Column(partitionValues_parsed.part_ts) > 1000000",
+        "OR(Column(partitionValues_parsed.part_ts) IS NULL, \
+         Column(partitionValues_parsed.part_ts) > 1000000)",
         "partition timestamp must not get the 999us data-column truncation adjustment"
     );
 }

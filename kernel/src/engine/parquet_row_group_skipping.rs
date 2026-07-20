@@ -321,9 +321,11 @@ struct StatsColumnIndices {
 /// returns `None` for any stat whose column contains null values in the row group (checked via
 /// the column's own null count in the parquet footer).
 ///
-/// Partition columns are handled separately: their footer min/max of
-/// `add.partitionValues_parsed.<col>` can be used directly without null guarding, because parquet
-/// footer stats ignore null values (which may appear for non-add action rows).
+/// Partition columns read their footer min/max of `add.partitionValues_parsed.<col>` directly. Not
+/// yet wired to production; a caller must first null-guard partition comparisons (a non-Add row's
+/// partition value is null, and footer min/max ignore it, so an unguarded range check could prune a
+/// row group that still holds that row). The production path instead evaluates a meta-predicate
+/// that carries the guard (see `crate::scan::data_skipping::as_prefixed_checkpoint_predicate`).
 #[allow(dead_code)]
 pub(crate) struct CheckpointRowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
@@ -444,12 +446,6 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
         // (can't decide), which prevents it from ever pruning checkpoint row groups. This also
         // allows the IS NOT NULL guard in `eval_pred_sql_where` to pass through for
         // null-intolerant binary comparisons, letting the actual comparison decide.
-        //
-        // NOTE: This blanket `None` also suppresses `partitionValues_parsed.<col> IS NOT NULL`
-        // pruning, which the plain [`RowGroupFilter`] used on the production checkpoint path can
-        // do soundly (footer null count and row count of a partition value column both reflect
-        // actual rows). Adopting this filter must special-case partition columns to avoid
-        // regressing that.
         None
     }
 }
