@@ -613,9 +613,9 @@ fn test_checkpoint_skipping_partition_is_not_null_never_prunes() {
     );
 }
 
-// SAFETY: when the checkpoint lacks `partitionValues_parsed` (older writer), the meta-predicate
-// still references it, but every stat resolves to unavailable -> the predicate is NULL/unknown ->
-// the row group is KEPT, never pruned. Simulated with a resolver that has no columns at all.
+// When the checkpoint lacks `partitionValues_parsed` (older writer), the meta-predicate still
+// references it, but every stat resolves to unavailable -> the predicate is NULL/unknown -> the
+// row group is KEPT, never pruned. Simulated with a resolver that has no columns at all.
 #[test]
 fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
     let partition_columns = HashSet::from(["part_col".to_string()]);

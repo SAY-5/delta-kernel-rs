@@ -21,7 +21,7 @@ use crate::expressions::{
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
+use crate::scan::data_skipping::{all_referenced_columns, as_prefixed_checkpoint_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
     self, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
@@ -1382,12 +1382,7 @@ impl CheckpointParquetBuilder {
 /// `build_actions_meta_predicate`. The skipping predicate already carries the `stats_parsed.*` /
 /// `partitionValues_parsed.*` struct paths, so the prefix is just `add`.
 fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
-    let stats = all_referenced_columns(pred);
-    let skipping_pred = as_checkpoint_skipping_predicate(pred, &HashSet::new(), &stats)?;
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add"]),
-    };
-    Some(prefixer.transform_pred(&skipping_pred).into_owned())
+    as_prefixed_checkpoint_predicate(pred, &HashSet::new(), &all_referenced_columns(pred))
 }
 
 /// Applies a meta predicate as a row group filter and returns the total rows read.

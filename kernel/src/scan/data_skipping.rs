@@ -352,9 +352,9 @@ impl DataSkippingFilter {
 ///
 /// Every comparison is wrapped in an IS NULL guard, so a row group is kept whenever the referenced
 /// stat is null. For data columns a null stat means a file is missing that statistic (footer
-/// min/max ignore nulls, so the aggregate is untrustworthy); for partition values a null means a
-/// non-Add row (Remove, metadata, ...), whose `partitionValues_parsed` is null. Guarding both keeps
-/// such row groups instead of pruning them. `col_a > 100` becomes:
+/// min/max ignore nulls, so the aggregate is untrustworthy); for partition values a null leaf means
+/// either a non-Add row (Remove, metadata, ...) or an Add with a null (e.g. Hive-default) partition
+/// value. Guarding both keeps such row groups instead of pruning them. `col_a > 100` becomes:
 /// ```text
 /// OR(stats_parsed.maxValues.col_a IS NULL, stats_parsed.maxValues.col_a > 100)
 /// ```
@@ -783,11 +783,11 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     /// non-null would drop those rows.
     ///
     /// A data column uses the `nullCount` stat:
-    /// `IS NULL` → `OR(nullCount.col IS NULL, nullCount.col != 0)` (column vs literal — the
-    /// RowGroupFilter can evaluate this via footer stats).
-    /// `IS NOT NULL` → `None`. The unguarded version produces `nullCount.col != numRecords`, which
-    /// is column vs column; the RowGroupFilter resolves one column at a time, so it can never
-    /// prune.
+    /// `IS NULL` → `OR(stats_parsed.nullCount.col IS NULL, stats_parsed.nullCount.col != 0)`
+    /// (column vs literal — the RowGroupFilter can evaluate this via footer stats).
+    /// `IS NOT NULL` → `None`. The unguarded version produces
+    /// `stats_parsed.nullCount.col != stats_parsed.numRecords`, which is column vs column; the
+    /// RowGroupFilter resolves one column at a time, so it can never prune.
     // TODO(#1873): IS NOT NULL pruning requires cross-column range comparison in RowGroupFilter.
     // Skippable when the nullCount and numRecords ranges don't overlap (e.g. nullCount in
     // [0, 0] vs numRecords in [500, 2000] proves all files have non-null values).
